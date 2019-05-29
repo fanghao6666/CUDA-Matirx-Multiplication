@@ -19,10 +19,17 @@
 #include <cublas_v2.h>
 #include <device_launch_parameters.h>
 
+#include <thrust/device_vector.h>
+#include <thrust/transform.h>
+#include <thrust/sequence.h>
+#include <thrust/copy.h>
+#include <thrust/fill.h>
+#include <thrust/replace.h>
+#include <thrust/functional.h>
 using namespace std;
 
 const unsigned int THREAD_PER_BLOCK = 1024;
-const int BLOCK_SIZE = 16;
+const int BLOCK_SIZE = 32;
 
 
 
@@ -50,21 +57,6 @@ __host__ void printMatrix(float* matrix,unsigned int row,unsigned int col)
 	}
 	cout << "*******************************************" << endl;
 	return;
-}
-/*
-* @func: array to vector
-*
-* @para: arr pointer to array
-*		 num  array element number
-*/
-vector<float> arrayToVector(float *arr,unsigned int num)
-{
-	vector<float> result(num);
-	for (size_t i = 0; i < num; ++i)
-	{
-		result[i] = arr[i];
-	}
-	return result;
 }
 
 
@@ -226,7 +218,7 @@ __host__ void matrixMulUseEigen(float* m_a, float* m_b, float* m_r, unsigned int
 __global__ void matrixMulOnGPU(float* m_a, float* m_b, float* m_r, unsigned int m, unsigned int n, unsigned int k)
 {
 	int threadId = (blockIdx.y * blockDim.y + threadIdx.y) * gridDim.x * blockDim.x + blockIdx.x * blockDim.x + threadIdx.x;
-	if (threadId >= n * k)
+	if (threadId >= m * k)
 		return;
 
 	int row = threadId / k;
@@ -417,7 +409,7 @@ __host__ void matrixMulUseGPUWithShared(float* m_a, float* m_b, float* m_r, unsi
 	cudaEventCreate(&stop);
 
 	cudaEventRecord(start, NULL);
-	matrixMulOnGPUWithShared<16> << <grid, block >> > (MA, MB, MR, m, n, k);
+	matrixMulOnGPUWithShared<32> << <grid, block >> > (MA, MB, MR, m, n, k);
 	cudaDeviceSynchronize();
 	cudaEventRecord(stop, NULL);
 	cudaEventSynchronize(stop);
@@ -448,6 +440,8 @@ __host__ void matrixMulUseGPUWithShared(float* m_a, float* m_b, float* m_r, unsi
 	return;
 }
 
+
+
 /*
 * @func: matrix multiplication on gpu use reduction algorithm
 *
@@ -458,11 +452,62 @@ __host__ void matrixMulUseGPUWithShared(float* m_a, float* m_b, float* m_r, unsi
 *        n    left matrix cols
 *        k    right matrix cols
 */
-__global__ void matrixMulUseGPUWithReduction(float* m_a, float* m_b, float* m_r, unsigned int m, unsigned int n, unsigned int k)
+__host__ void matrixMulUseGPUWithReduction(float* m_a, float* m_b, float* m_r, unsigned int m, unsigned int n, unsigned int k)
 {
+	if (m <= 0 || n <= 0 || k <= 0)
+	{
+		cout << "Matrix size error !" << endl;
+		return;
+	}
+	vector<vector<float>> a;
+	vector<vector<float>> b;
 
+	vector<float> a_tmp;
+	vector<float> b_tmp;
+	for (int i = 0; i < m; ++i)
+	{
+		for (int j = 0; j < n; ++j)
+		{
+			a_tmp.push_back(m_a[i * n + j]);
+		}
+		a.push_back(a_tmp);
+		a_tmp.clear();
+	}
+	for (int i = 0; i < k; ++i)
+	{
+		for (int j = 0; j < n; ++j)
+		{
+			b_tmp.push_back(m_b[j * k + i]);
+		}
+		b.push_back(b_tmp);
+		b_tmp.clear();
+	}
+	clock_t start = clock();
+	thrust::device_vector<float> result(n);
+	for (int i = 0; i < m; ++i)
+	{
+		for (int j = 0; j < k; ++j)
+		{
+			thrust::device_vector<float> row(a[i].begin(), a[i].end());
+			thrust::device_vector<float> col(b[j].begin(), b[j].end());
+
+			thrust::transform(row.begin(), row.end(), col.begin(), result.begin(), thrust::multiplies<float>());
+
+			m_r[i * k + j] = thrust::reduce(result.begin(),result.end());
+		}
+	}
+	clock_t end = clock();
+
+
+	cout << endl << "*******************************************" << endl
+		<< "Matrix A size : " << m << " * " << n << endl
+		<< "Matrix B size : " << n << " * " << k << endl
+		<< "GPUMultiTimeReduction : " << (end - start) << " ms" << endl
+		<< "*******************************************"
+		<< endl;
+
+	return;
 }
-
 
 /*
 * @func: matrix multiplication on gpu use cublas
@@ -561,9 +606,20 @@ int main()
 	unsigned int m, n, k;
 	// left,right,result matrix pointer
 	float *matrix_a, *matrix_b, *matrix_r;
+	// mode
+	int mode;
 
 // 2、Assignment of variables
-	cout << "Please input the size of left and right matrix : (m n k)" << endl;
+	cout << "Please select matrix multiply mode :" << endl
+		<< "1、Naive CPU" << endl
+		<< "2、Eigen " << endl
+		<< "3、Naive GPU" << endl
+		<< "4、GPU Shared Memory" << endl
+		<< "5、GPU Reduction" << endl
+		<< "6、GPU Cublas" << endl;
+
+	cin >> mode;
+	cout << endl << "Please input the size of left and right matrix : (m n k)" << endl;
 	while (n <= 0 || m <= 0 || k <= 0)
 	{
 		cin >> m >> n >> k;
@@ -577,35 +633,35 @@ int main()
 	genMatrixValue(&matrix_a, &matrix_b, &matrix_r, m, n, k);
 
 // 4、Matrix multiply
+	switch (mode)
+	{
 	// 4.1、matrix multiply on CPU
-	matrixMulOnCPU(matrix_a, matrix_b, matrix_r, m, n, k);
-	vector<float> CPU = arrayToVector(matrix_r, m*k);
-
+	case 1:
+		matrixMulOnCPU(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
 	// 4.2、matrix multiply use Eigen
-	matrixMulUseEigen(matrix_a, matrix_b, matrix_r, m, n, k);
-	vector<float> Eigen = arrayToVector(matrix_r, m*k);
-
+	case 2:
+		matrixMulUseEigen(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
 	// 4.3、matrix multiply on GPU
-	matrixMulUseGPU(matrix_a, matrix_b, matrix_r, m, n, k);
-	vector<float> GPU = arrayToVector(matrix_r, m*k);
-
+	case 3:
+		matrixMulUseGPU(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
 	// 4.4、matrix multiply on GPU with Shared memory
-	matrixMulUseGPUWithShared(matrix_a, matrix_b, matrix_r, m, n, k);
-	vector<float> GPUShared = arrayToVector(matrix_r, m*k);
-
-	// 4.5、matrix multiply on GPU with Cublas
-	matrixMulUseGPUWithCublas(matrix_a, matrix_b, matrix_r, m, n, k);
-	vector<float> GPUCublas = arrayToVector(matrix_r, m*k);
-
-
-	cout << (GPUCublas == GPU) << endl;
-
-	/*printMatrix(matrix_a, m, n);
-	printMatrix(matrix_b, n, k);
-	printMatrix(matrix_r, m, k);*/
-
-
-	getchar();
-
+	case 4:
+		matrixMulUseGPUWithShared(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
+	// 4.5、matrix multiply on GPU with Reduction
+	case 5:
+		matrixMulUseGPUWithReduction(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
+	// 4.6、matrix multiply on GPU with Cublas
+	case 6:
+		matrixMulUseGPUWithCublas(matrix_a, matrix_b, matrix_r, m, n, k);
+		break;
+	default:
+		break;
+	}
+	
 	return 0;
 }
