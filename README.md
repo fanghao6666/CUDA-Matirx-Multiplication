@@ -9,7 +9,7 @@
 5. GPU并行矩阵乘法优化--并行规约
 6. GPU矩阵计算库--[cuBLAS](https://developer.nvidia.com/cublas)
 
-## CPU端循环计算矩阵乘法
+## 1、CPU端循环计算矩阵乘法
 
 <img src="https://github.com/fanghao6666/CUDA-Matirx-Multiplication/blob/master/image/matrix.PNG" width="60%" height="60%"/>
 
@@ -57,7 +57,7 @@ __host__ void matrixMulOnCPU(float* m_a, float* m_b, float* m_r, unsigned int m,
 }
 ~~~
 
-## [Eigen库](http://eigen.tuxfamily.org/index.php?title=Main_Page)矩阵乘法
+## 2、[Eigen库](http://eigen.tuxfamily.org/index.php?title=Main_Page)矩阵乘法
 
 Eigen是一个高层次的C ++库，有效支持线性代数，矩阵和矢量运算，数值分析及其相关的算法.Eigen中内建的有矩阵数据结构MatrixXd,我们将A和B矩阵转换为Eige的MatrixXd数据结构，然后直接进行矩阵乘法就可以得到结果矩阵，Eigen的运算也是在CPU端进行的，但是相比较CPU端的遍历循环的方法，Eigen对矩阵乘法做了一些优化，大大的提升了运算速度，但是毕竟在CPU上进行运算，所以当矩阵的维度达到一定大小时，消耗时间还是会大幅增加。具体代码如下：
 ~~~cpp
@@ -119,7 +119,7 @@ __host__ void matrixMulUseEigen(float* m_a, float* m_b, float* m_r, unsigned int
 }
 ~~~
 
-## GPU并行矩阵乘法
+## 3、GPU并行矩阵乘法
 
    在CPU端进行矩阵乘法运算的限制在于对于结果矩阵C的每个值都需要进行一次向量点乘运算，但是我们观察到C中每个值的计算是相对独立的，不需要依赖其他的值，这也就意味这这些运算是可以并行处理的，于是我们便可以利用GPU的并行计算能力来进行矩阵乘法运算。如果你对CUDA的一些概念不是很理解的话，可以先看下[这篇文章](https://blog.csdn.net/hujingshuang/article/details/53097222),简单了解一下grid,block,thread等基本概念。然后介绍下在GPU上进行矩阵运算的基本思路：由于得到结果矩阵C我们需要进行M*K次的向量点乘运算，于是我们开辟M*k个线程，每个线程负责计算其中的一个值，那么当所有线程同时计算完成时也就得到了结果矩阵C，于是将M*K次运算简化为1次运算，理论上时间缩短了M*K倍，当然由于还需要CPU和GPU之间进行数据通信，所以实际上并没有M*K倍，但是速度提升的效果还是十分明显的，矩阵的维度越大时效果越明显。具体代码如下：
 ~~~cpp
@@ -150,12 +150,80 @@ __global__ void matrixMulOnGPU(float* m_a, float* m_b, float* m_r, unsigned int 
 }
 ~~~   
 
-## GPU并行矩阵乘法优化--共享内存
+## 4、GPU并行矩阵乘法优化--共享内存
 
 <img src="https://github.com/fanghao6666/CUDA-Matirx-Multiplication/blob/master/image/GPU.png" width="60%" height="60%"/>
 
    上图为GPU CUDA的架构图，CUDA中的内存种类有多种，每个Grid内部有Constant Memory,Global Memory,和Texture Memory,每个Block内部有Shared Memory,每个Thread对应有Local Memory和Register。关于更加详细的内存介绍可以看[这篇文章](https://blog.csdn.net/qq_36387683/article/details/81125453),我们将采用shared Memory来对矩阵乘法进行加速。
    从上述的架构图和未优化的代码来看，我们的A和B矩阵是存储在Global Memory上，每个线程需要进行计算的时候都会到Global Memory上去取数据，然后再进行计算。在GPU中，传输数据所占用的时间远远要大于进行计算所花的时间。所以我们得想办法能不能减少数据的传输。利用Shared Memory就可以很好的解决这个问题。Shared Memory是位于每个Block内部的内存，所有的该Block内部的Thread共享这个内存，这样每个线程计算的时候就不需要每个线程都取Global Memory取数据，大大节省了数据传输的时间。由于每个Block的最大线程数有限（GTX1080 1024 线程/BLOCK），而且每个block的shared memory大小有限，所以并不能把A矩阵和B矩阵都导入到shared Memory里去，于是我们便对矩阵进行分块处理，如下图所示：
    
-   
 <img src="https://github.com/fanghao6666/CUDA-Matirx-Multiplication/blob/master/image/shared.PNG" width="60%" height="60%"/>
+
+我们将结果矩阵C分为若干小块，每个小块的大小为32 * 32 （1024），每个小块作为一个Block,计算这个block内部的数据只需要A矩阵中的32 * N的子矩阵和B矩阵中的N * 32的子矩阵，于是我们将A和B的子矩阵一次性从Global Memory 导入到Block的shared Memory内部，然后再对Block内部的所有Thread进行计算。利用shared memory可以大大的减少线程对于Global Memory的数据传输，极大的减少了时间消耗。具体代码如下：
+~~~cpp
+/*
+* @func: matrix multiplication on gpu use shared memory
+*
+* @para: m_a  left multi matrix
+*		 m_b  right multi matrix
+*		 m_r  result matrix
+*		 m    left matrix rows
+*        n    left matrix cols
+*        k    right matrix cols
+*/
+template<int BLOCK_SIZE>
+__global__ void matrixMulOnGPUWithShared(float* m_a, float* m_b, float* m_r, unsigned int m, unsigned int n, unsigned int k)
+{
+	// thread location
+	int block_x = blockIdx.x;
+	int block_y = blockIdx.y;
+	int thread_x = threadIdx.x;
+	int thread_y = threadIdx.y;
+
+	if ((thread_y + block_y * blockDim.y) * k + block_x * blockDim.x + thread_x >= m * k)
+	{
+		return;
+	}
+
+	// blockDim.x == blockDim.y == BLOCK_SIZE here
+	const int begin_a = block_y * blockDim.y * n;
+	const int end_a = begin_a + n - 1;
+	const int step_a = blockDim.x;
+
+	const int begin_b = block_x * blockDim.x;
+	const int step_b = blockDim.y * k;
+
+	float result_temp = 0.0f;
+
+	for (int index_a = begin_a, int index_b = begin_b; index_a < end_a; index_a += step_a, index_b += step_b)
+	{
+		// shared memory
+		__shared__ float SubMat_A[BLOCK_SIZE][BLOCK_SIZE];
+		__shared__ float SubMat_B[BLOCK_SIZE][BLOCK_SIZE];
+
+		// copy data to shared memory
+		SubMat_A[thread_y][thread_x] = m_a[index_a + thread_y * n + thread_x];
+		SubMat_B[thread_y][thread_x] = m_b[index_b + thread_y * k + thread_x];
+
+		__syncthreads();
+
+		for (int i = 0; i < BLOCK_SIZE; ++i)
+		{
+			result_temp += SubMat_A[thread_y][i] * SubMat_B[i][thread_x];
+		}
+
+		__syncthreads();
+	}
+
+	int begin_result = block_y * blockDim.y * k + begin_b;
+	m_r[begin_result + thread_y * k + thread_x] = result_temp;
+}
+~~~
+
+## 5、GPU并行矩阵乘法优化--并行规约
+
+<img src="https://github.com/fanghao6666/CUDA-Matirx-Multiplication/blob/master/image/reduction.png" width="60%" height="60%"/>
+
+	
+
+
